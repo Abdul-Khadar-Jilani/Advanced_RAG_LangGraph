@@ -1,0 +1,9 @@
+langchain-nvidia-ai-endpoints
+langgraph 
+langchain-community 
+faiss-cpu 
+tavily-python 
+langgraph-checkpoint-sqlite
+bs4
+streamlit
+pypdf
