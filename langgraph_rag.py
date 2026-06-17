@@ -33,8 +33,10 @@ load_dotenv()
 
 
 # Set up environment variables
-os.environ["NVIDIA_API_KEY"] = os.getenv("NVIDIA_API_KEY", "")  # Replace with your actual API key
-os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY", "")  # Replace with your actual API key
+for key in ("NVIDIA_API_KEY", "TAVILY_API_KEY", "USER_AGENT"):
+    value = os.getenv(key)
+    if value:
+        os.environ[key] = value
 
 # Initialize models and tools
 llm = ChatNVIDIA(
@@ -48,6 +50,10 @@ embeddings = NVIDIAEmbeddings(
     model="nvidia/nv-embedqa-e5-v5",
     truncate="END"
 )
+
+EMBEDDING_CHUNK_SIZE = 450
+EMBEDDING_CHUNK_OVERLAP = 80
+
 web_search_tool = TavilySearchResults(k=3)
 
 # Pydantic models for structured outputs
@@ -101,7 +107,8 @@ def setup_vectorstore():
 
     # Split documents
     text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=1000, chunk_overlap=200
+        chunk_size=EMBEDDING_CHUNK_SIZE,
+        chunk_overlap=EMBEDDING_CHUNK_OVERLAP,
     )
     doc_splits = text_splitter.split_documents(docs_list)
 

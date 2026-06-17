@@ -10,6 +10,8 @@ Changes from original:
 """
 
 import os
+import operator
+import re
 from typing import Annotated, List, TypedDict, Optional
 from pydantic import BaseModel, Field
 
@@ -32,10 +34,10 @@ import dotenv
 dotenv.load_dotenv()  # Load environment variables from .env file
 
 # === Environment (replace keys before production) ===
-
-#load api keys from .env file
-os.environ["NVIDIA_API_KEY"] = os.getenv("NVIDIA_API_KEY")
-os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
+for key in ("NVIDIA_API_KEY", "TAVILY_API_KEY", "USER_AGENT"):
+    value = os.getenv(key)
+    if value:
+        os.environ[key] = value
 
 
 # === LLMs and embeddings (same as original) ===
@@ -50,6 +52,9 @@ embeddings = NVIDIAEmbeddings(
     model="nvidia/nv-embedqa-e5-v5",
     truncate="END"
 )
+
+EMBEDDING_CHUNK_SIZE = 450
+EMBEDDING_CHUNK_OVERLAP = 80
 
 # web search tool (keeps same behavior for websearch)
 web_search_tool = TavilySearchResults(k=3)
@@ -79,6 +84,7 @@ class GraphState(TypedDict):
     documents: List[dict]
     # retriever may be passed in from outside (UI)
     retriever: Optional[object]
+    trace: Annotated[List[str], operator.add]
 
 # === (Optional) helper: setup_vectorstore() left here but NOT called by default ===
 # You can keep this for programmatic vectorstore creation if you want,
@@ -98,7 +104,10 @@ def setup_vectorstore(urls: Optional[List[str]] = None, docs: Optional[List] = N
     if not docs:
         return None
 
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=1000, chunk_overlap=200)
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=EMBEDDING_CHUNK_SIZE,
+        chunk_overlap=EMBEDDING_CHUNK_OVERLAP,
+    )
     doc_splits = text_splitter.split_documents(docs)
     embedder = embed_model or embeddings
     vectorstore = FAISS.from_documents(doc_splits, embedding=embedder)
@@ -164,6 +173,9 @@ rag_prompt = ChatPromptTemplate.from_template(
 
 hallucination_grader_prompt = ChatPromptTemplate.from_template(
     """You are a grader assessing whether an answer is grounded in / supported by a set of facts.
+    Grade "yes" if the answer is directly supported by the facts, even when it uses a concise sentence,
+    a label such as "phone number", or minor formatting differences for values.
+    Grade "no" only when the answer adds information that is not present in the facts.
     Give a binary 'yes' or 'no' score to indicate whether the answer is grounded in the facts.
 
     <facts>
@@ -179,6 +191,8 @@ hallucination_grader_prompt = ChatPromptTemplate.from_template(
 
 answer_grader_prompt = ChatPromptTemplate.from_template(
     """You are a grader assessing whether an answer is useful to resolve a question.
+    Grade "yes" if the answer provides the requested value or clearly says the value is not available.
+    Do not require extra explanation for simple factual questions.
     Give a binary 'yes' or 'no' score to indicate whether the answer is useful to resolve a question.
 
     <question>
@@ -211,6 +225,119 @@ hallucination_grader = hallucination_grader_prompt | structured_llm_hallucinatio
 answer_grader = answer_grader_prompt | structured_llm_answer_grader
 question_rewriter = question_rewriter_prompt | llm | StrOutputParser()
 
+
+def _get_binary_score(result) -> str:
+    score = getattr(result, "binary_score", None)
+    if score is None:
+        return "no"
+    return str(score).strip().lower()
+
+
+def _document_text(document) -> str:
+    """Return page text from LangChain Document objects or dict-like docs."""
+    if document is None:
+        return ""
+    page_content = getattr(document, "page_content", None)
+    if page_content is not None:
+        return str(page_content)
+    if isinstance(document, dict):
+        return str(document.get("page_content", ""))
+    return str(document)
+
+
+def _format_documents_for_prompt(documents) -> str:
+    return "\n\n".join(_document_text(document) for document in documents)
+
+
+def _query_terms(text: str) -> set[str]:
+    stop_words = {
+        "a", "an", "and", "are", "as", "at", "by", "for", "from", "how", "i",
+        "in", "is", "it", "me", "my", "of", "on", "or", "the", "this", "to",
+        "what", "when", "where", "which", "who", "whom", "whose", "with",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in stop_words
+    }
+
+
+def _has_lexical_relevance(question: str, document_text: str) -> bool:
+    question_terms = _query_terms(question)
+    if not question_terms:
+        return False
+
+    document_terms = _query_terms(document_text)
+    overlap = question_terms & document_terms
+    overlap_ratio = len(overlap) / len(question_terms)
+
+    return len(overlap) >= 2 or overlap_ratio >= 0.4
+
+
+def _normalize_digits(text: str) -> str:
+    return re.sub(r"\D", "", text)
+
+
+def _extract_grounding_values(text: str) -> set[str]:
+    values = {value.lower() for value in re.findall(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", text)}
+    values.update(value.lower().rstrip(".,;:)") for value in re.findall(r"https?://\S+|www\.\S+", text))
+
+    for raw_number in re.findall(r"\+?\d[\d\s().-]{3,}\d", text):
+        normalized = _normalize_digits(raw_number)
+        if len(normalized) >= 4:
+            values.add(normalized)
+
+    return values
+
+
+def _are_values_supported(generation_values: set[str], context_values: set[str]) -> bool:
+    for value in generation_values:
+        if value in context_values:
+            continue
+
+        if value.isdigit() and any(
+            context_value.isdigit()
+            and (context_value.endswith(value) or value.endswith(context_value))
+            for context_value in context_values
+        ):
+            continue
+
+        return False
+
+    return True
+
+
+def _is_generation_grounded_in_context(generation: str, context: str) -> bool:
+    generation = (generation or "").strip()
+    if not generation:
+        return False
+
+    generation_values = _extract_grounding_values(generation)
+    if generation_values:
+        context_values = _extract_grounding_values(context)
+        return _are_values_supported(generation_values, context_values)
+
+    generation_terms = _query_terms(generation)
+    if not generation_terms:
+        return False
+
+    context_terms = _query_terms(context)
+    overlap_ratio = len(generation_terms & context_terms) / len(generation_terms)
+    return overlap_ratio >= 0.75
+
+
+def _does_generation_answer_question(question: str, generation: str) -> bool:
+    generation = (generation or "").strip()
+    if not generation:
+        return False
+
+    if _extract_grounding_values(generation):
+        return True
+
+    question_terms = _query_terms(question)
+    generation_terms = _query_terms(generation)
+    return bool(question_terms & generation_terms)
+
 # === Node functions (preserve prints and comment state dumps) ===
 def route_question(state):
     print("---ROUTE QUESTION---")
@@ -218,19 +345,29 @@ def route_question(state):
     print(f"Question: {question}")
     has_local_kb = state.get("retriever") is not None
 
-    source = question_router.invoke({
-        "question": question,
-        "has_local_kb": has_local_kb
-    })
+    try:
+        source = question_router.invoke({
+            "question": question,
+            "has_local_kb": has_local_kb
+        })
+    except Exception as exc:
+        print(f"⚠️ Router failed: {exc}")
+        source = None
 
-    print(f"Route to: {source.datasource}")
+    datasource = getattr(source, "datasource", None)
+    if datasource not in {"websearch", "vectorstore"}:
+        datasource = "vectorstore" if has_local_kb else "websearch"
 
-    if source.datasource == "websearch":
+    print(f"Route to: {datasource}")
+
+    if datasource == "websearch":
         print("---ROUTE QUESTION TO WEB SEARCH---")
         return "websearch"
-    elif source.datasource == "vectorstore":
+    elif datasource == "vectorstore":
         print("---ROUTE QUESTION TO RAG---")
         return "vectorstore"
+
+    return "websearch"
 
 
 
@@ -245,7 +382,7 @@ def retrieve(state):
     retriever = state.get("retriever")
     if retriever is None:
         print("⚠️ No retriever provided — skipping vectorstore retrieval.")
-        return {"documents": [], "question": question}
+        return {"documents": [], "question": question, "trace": ["retrieve"]}
 
     # Try common retriever interfaces robustly
     documents = []
@@ -266,7 +403,12 @@ def retrieve(state):
         print(f"Error while invoking retriever: {e}")
         documents = []
 
-    return {"documents": documents, "question": question}
+    if documents:
+        print(f"Retrieved {len(documents)} document(s)")
+    else:
+        print("⚠️ No documents retrieved")
+    
+    return {"documents": documents, "question": question, "trace": ["retrieve"]}
 
 
 def grade_documents(state):
@@ -276,21 +418,37 @@ def grade_documents(state):
     documents = state.get("documents", []) or []
 
     filtered_docs = []
+    rejected_docs = []
     web_search = "No"
     for d in documents:
-        # d may be a Document-like object or a dict; try to get page_content
-        page_text = getattr(d, "page_content", None) or d.get("page_content", "")
-        score = retrieval_grader.invoke({"question": question, "document": page_text})
-        grade = score.binary_score
-        if grade.lower() == "yes":
+        page_text = _document_text(d)
+        try:
+            score = retrieval_grader.invoke({"question": question, "document": page_text})
+            grade = _get_binary_score(score)
+        except Exception as exc:
+            print(f"⚠️ Document grader failed: {exc}")
+            grade = "no"
+
+        if grade == "yes" or _has_lexical_relevance(question, page_text):
             print("---GRADE: DOCUMENT RELEVANT---")
             filtered_docs.append(d)
         else:
             print("---GRADE: DOCUMENT NOT RELEVANT---")
+            rejected_docs.append(d)
             web_search = "Yes"
             continue
 
-    return {"documents": filtered_docs, "question": question, "web_search": web_search}
+    if not filtered_docs and rejected_docs and state.get("retriever") is not None:
+        print("---GRADE FALLBACK: KEEPING RETRIEVED LOCAL DOCUMENTS---")
+        filtered_docs = rejected_docs
+        web_search = "No"
+
+    return {
+        "documents": filtered_docs,
+        "question": question,
+        "web_search": web_search,
+        "trace": ["grade_documents"],
+    }
 
 
 def generate(state):
@@ -300,14 +458,15 @@ def generate(state):
     documents = state.get("documents", []) or []
 
     # Prepare context — join page_content where available
-    context_texts = []
-    for d in documents:
-        content = getattr(d, "page_content", None) or d.get("page_content", "")
-        context_texts.append(content)
-    context = "\n\n".join(context_texts)
+    context = _format_documents_for_prompt(documents)
 
     generation = rag_chain.invoke({"context": context, "question": question})
-    return {"documents": documents, "question": question, "generation": generation}
+    return {
+        "documents": documents,
+        "question": question,
+        "generation": generation,
+        "trace": ["generate"],
+    }
 
 
 def grade_generation_v_documents_and_question(state):
@@ -316,16 +475,35 @@ def grade_generation_v_documents_and_question(state):
     question = state["question"]
     documents = state.get("documents", []) or []
     generation = state.get("generation", "")
+    context = _format_documents_for_prompt(documents)
 
-    score = hallucination_grader.invoke({"documents": documents, "generation": generation})
-    grade = score.binary_score
+    if _is_generation_grounded_in_context(generation, context):
+        print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
+        if _does_generation_answer_question(question, generation):
+            print("---DECISION: GENERATION ADDRESSES QUESTION---")
+            return "useful"
+
+    try:
+        score = hallucination_grader.invoke({
+            "documents": context,
+            "generation": generation,
+        })
+        grade = _get_binary_score(score)
+    except Exception as exc:
+        print(f"⚠️ Hallucination grader failed: {exc}")
+        grade = "no"
 
     if grade == "yes":
         print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
         # Check question-answering
         print("---GRADE GENERATION vs QUESTION---")
-        score2 = answer_grader.invoke({"question": question, "generation": generation})
-        grade2 = score2.binary_score
+        try:
+            score2 = answer_grader.invoke({"question": question, "generation": generation})
+            grade2 = _get_binary_score(score2)
+        except Exception as exc:
+            print(f"⚠️ Answer grader failed: {exc}")
+            grade2 = "no"
+
         if grade2 == "yes":
             print("---DECISION: GENERATION ADDRESSES QUESTION---")
             return "useful"
@@ -346,7 +524,7 @@ def web_search(state):
         docs = web_search_tool.invoke({"query": question})
     except Exception as e:
         print(f"⚠️ Web search tool failed: {e}")
-        return {"documents": documents, "question": question}
+        return {"documents": documents, "question": question, "trace": ["websearch"]}
 
     # Normalize different formats into page_content strings
     normalized_contents = []
@@ -364,7 +542,7 @@ def web_search(state):
     web_results_doc = {"page_content": "\n".join(normalized_contents)}
     documents.append(web_results_doc)
 
-    return {"documents": documents, "question": question}
+    return {"documents": documents, "question": question, "trace": ["websearch"]}
 
 
 def transform_query(state):
@@ -374,7 +552,7 @@ def transform_query(state):
     documents = state.get("documents", []) or []
 
     better_question = question_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
+    return {"documents": documents, "question": better_question, "trace": ["transform_query"]}
 
 
 def decide_to_generate(state):
@@ -413,8 +591,8 @@ workflow.add_conditional_edges(
     "grade_documents",
     decide_to_generate,
     {
-        "websearch": "websearch",
-        "generate": "generate",
+        "DOCS_RELEVANT": "generate",
+        "DOCS_IRRELEVANT": "websearch",
     },
 )
 workflow.add_edge("websearch", "generate")
@@ -437,11 +615,35 @@ def run_rag_agent(question: str, retriever=None):
     Run the RAG agent with an optional retriever (passed from UI).
     If retriever is None, the pipeline will route to websearch.
     """
-    inputs = {"question": question, "retriever": retriever}
+    inputs = {"question": question, "retriever": retriever, "trace": []}
     # stream/monitoring is optional; here we just invoke for final result
     final_state = app.invoke(inputs)
     # generation key keeps compatibility with previous code
     return final_state.get("generation")
+
+
+def run_rag_agent_with_trace(question: str, retriever=None):
+    """
+    Run the RAG agent and return both the final answer and a node trace.
+    """
+    inputs = {"question": question, "retriever": retriever, "trace": []}
+    final_state = app.invoke(inputs)
+    trace = list(final_state.get("trace", []))
+
+    if trace:
+        first_step = trace[0]
+        if first_step in {"retrieve", "websearch"}:
+            trace.insert(0, f"route_question -> {first_step}")
+    elif retriever is None:
+        trace = ["route_question -> websearch"]
+    else:
+        trace = ["route_question -> vectorstore"]
+
+    return {
+        "answer": final_state.get("generation"),
+        "trace": trace,
+        "final_state": final_state,
+    }
 
 # === Example CLI test ===
 if __name__ == "__main__":

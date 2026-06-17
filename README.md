@@ -188,8 +188,8 @@ model="nvidia/nv-embedqa-e5-v5"
 ### Vector Store Settings
 ```python
 # Text Splitting
-chunk_size=1000          # Characters per chunk
-chunk_overlap=200        # Overlap between chunks
+chunk_size=450           # Tokens per chunk; stays below nv-embedqa-e5-v5's 512-token limit
+chunk_overlap=80         # Overlap between chunks
 
 # Web Search
 web_search_results=3     # Results per query (k=3)
