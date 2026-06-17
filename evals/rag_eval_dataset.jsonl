@@ -1,0 +1,3 @@
+{"question": "What warranty period is mentioned for the device?", "answer_contains": ["warranty"], "notes": "Checks generic policy/manual QA."}
+{"question": "What is the invoice total?", "answer_contains": ["total"], "notes": "Checks numeric extraction from business documents."}
+{"question": "Who approved the project proposal?", "answer_contains": ["approved"], "notes": "Checks entity extraction from reports or memos."}

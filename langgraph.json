@@ -1,0 +1,7 @@
+{
+  "dependencies": ["-r requirements.txt"],
+  "graphs": {
+    "advanced_rag": "./advanced_rag/graph.py:app"
+  },
+  "env": ".env"
+}

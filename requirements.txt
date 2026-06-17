@@ -7,3 +7,5 @@ langgraph-checkpoint-sqlite
 bs4
 streamlit
 pypdf
+python-dotenv
+unstructured
